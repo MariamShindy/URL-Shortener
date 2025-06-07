@@ -1,0 +1,136 @@
+const { nanoid } = require('nanoid');
+const bcrypt = require('bcrypt');
+const geoip = require('geoip-lite');
+const QRCode = require('qrcode');
+const db = require('../db');
+const { sql } = require('drizzle-orm');
+
+/*
+ * Shortens a given URL and stores data in the database.
+ */
+async function shorten(req, res) {
+  try {
+    const { original_url, expires_at, password, custom_slug } = req.validated;
+    const short_slug = custom_slug || nanoid(8);
+    const password_hash = password ? await bcrypt.hash(password, 10) : null;
+    const created_by = req.user.id;
+
+    await db.run(sql`
+      INSERT INTO links (
+        original_url, 
+        short_slug, 
+        created_by, 
+        expires_at, 
+        password_hash
+      ) VALUES (
+        ${original_url}, 
+        ${short_slug}, 
+        ${created_by}, 
+        ${expires_at}, 
+        ${password_hash}
+      )
+    `);
+
+    const short_url = `${req.protocol}://${req.get('host')}/${short_slug}`;
+    res.json({ success: true, short_url });
+
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}
+
+/*
+ * Retrieves all short URLs created by the current user.
+ */
+async function getMySlugs(req, res) {
+  try {
+    const userId = req.user.id;
+
+    const slugs = await db.all(sql`
+      SELECT id, original_url, short_slug, created_at, expires_at, click_count
+      FROM links
+      WHERE created_by = ${userId}
+      ORDER BY created_at DESC
+    `);
+
+    res.json({ slugs });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+}
+
+/*
+ * Redirects a short URL slug to its original URL, optionally checking for a password,
+ * logs the visit with geolocation, and increments click count.
+ */
+async function redirectToOriginal(req, res) {
+  try {
+    const { slug } = req.params;
+    const link = await db.get(sql`
+      SELECT * FROM links WHERE short_slug = ${slug}
+    `);
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found' });
+    }
+
+    if (link.password_hash) {
+      const providedPassword = req.query.password;
+      if (!providedPassword) {
+        return res.status(401).json({ error: 'Password required' });
+      }
+
+      const match = await bcrypt.compare(providedPassword, link.password_hash);
+      if (!match) {
+        return res.status(401).json({ error: 'Invalid password' });
+      }
+    }
+
+    const ip = req.ip;
+    const user_agent = req.headers['user-agent'];
+    const referrer = req.get('referrer') || '';
+    const geo = geoip.lookup(ip);
+    const country = geo ? geo.country : 'Unknown';
+
+    await db.run(sql`
+      UPDATE links
+      SET click_count = click_count + 1
+      WHERE id = ${link.id}
+    `);
+
+    await db.run(sql`
+      INSERT INTO visits (
+        link_id,
+        ip_address,
+        user_agent,
+        referrer,
+        country
+      ) VALUES (
+        ${link.id},
+        ${ip},
+        ${user_agent},
+        ${referrer},
+        ${country}
+      )
+    `);
+
+    res.redirect(link.original_url);
+  } catch (err) {
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+}
+
+async function getQRCode(req, res) {
+  try {
+    const url = `${req.protocol}://${req.get('host')}/${req.link.short_slug}`;
+    
+    // Generate a PNG buffer instead of a base64 data URL
+    const qrBuffer = await QRCode.toBuffer(url);
+
+    // Set content type and send the image
+    res.set('Content-Type', 'image/png');
+    res.send(qrBuffer);
+  } catch (err) {
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+}
+module.exports = { shorten, getMySlugs, redirectToOriginal, getQRCode };

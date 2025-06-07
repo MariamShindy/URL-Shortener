@@ -1,0 +1,66 @@
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const db = require('../db');
+const { sql } = require('drizzle-orm');
+
+require('dotenv').config();
+const SECRET = process.env.JWT_SECRET;
+
+/*
+ * Handles user registration.
+ * - Hashes the password
+ * - Inserts the user record into the database
+ */
+async function register(req, res) {
+  try {
+    const { email, password, name } = req.validated;
+    const hashed_password = await bcrypt.hash(password, 10);
+    await db.run(sql`
+      INSERT INTO users (email, hashed_password, name)
+      VALUES (${email}, ${hashed_password}, ${name})
+    `);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}
+
+/*
+ * Handles user login.
+ * - Verifies email and password
+ * - Generates and returns a JWT token if successful
+ */
+async function login(req, res) {
+  try {
+    const { email, password } = req.validated;
+    const user = await db.get(sql`
+      SELECT * FROM users WHERE email = ${email}
+    `);
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
+    const match = await bcrypt.compare(password, user.hashed_password);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+    const token = jwt.sign({ id: user.id, email: user.email }, SECRET, { expiresIn: '1h' });
+    res.json({ token });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+/*
+ * Fetches the currently authenticated user's profile.
+ */
+async function getMe(req, res) {
+  try {
+    const user = await db.get(sql`
+      SELECT id, email, name FROM users WHERE id = ${req.user.id}
+    `);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ user });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+module.exports = { register, login, getMe };
